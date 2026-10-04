@@ -111,6 +111,11 @@ typedef struct async_state {
     int canceled;
     int cleaned;
     int completion_queued;
+    int retain_result;
+    int callback_running;
+    int completion_dispatched;
+    int result_consumed;
+    int token_utf16;
     void *payload;
     char name[48];
 } async_state;
@@ -388,10 +393,47 @@ static void run_dowork(async_state *st)
 static void run_completion(async_state *st)
 {
     XAsyncBlock *block;
+    int cleanup;
     if (!st || st->cleaned) return;
     block = st->block;
+    if (!st->retain_result) {
+        /* Preserve the existing runtime's provider lifecycle. Only the new
+         * save, token and Store operations opt into retained results. */
+        if (block && block->callback) block->callback(block);
+        cleanup_state(st);
+        return;
+    }
+    EnterCriticalSection(&g_lock);
+    st->callback_running = 1;
+    st->completion_dispatched = 1;
+    if (st->result_consumed && st->block) {
+        state_mark_done(st->block, st->result, st->required);
+        st->block = NULL;
+    }
+    LeaveCriticalSection(&g_lock);
     if (block && block->callback) block->callback(block);
-    cleanup_state(st);
+    EnterCriticalSection(&g_lock);
+    st->callback_running = 0;
+    cleanup = !st->retain_result || st->result_consumed;
+    LeaveCriticalSection(&g_lock);
+    if (cleanup) cleanup_state(st);
+}
+
+/* Result methods can be called from the callback or later on a game thread. */
+static void consume_async(async_state *st)
+{
+    int cleanup;
+    EnterCriticalSection(&g_lock);
+    st->result_consumed = 1;
+    /* A pending callback still owns a reference to the state and needs the
+     * block for delivery. A callback may free the block before returning. */
+    if (!st->completion_queued || st->callback_running || st->completion_dispatched) {
+        if (st->block) state_mark_done(st->block, st->result, st->required);
+        st->block = NULL;
+    }
+    cleanup = !st->callback_running && (!st->completion_queued || st->completion_dispatched);
+    LeaveCriticalSection(&g_lock);
+    if (cleanup) cleanup_state(st);
 }
 
 static void run_item(task_item *it)
@@ -785,6 +827,10 @@ static HRESULT WINAPI thr_GetResult(void *self, XAsyncBlock *async, const void *
     (void)self;
     if (!st) return E_INVALIDARG_;
     if (!st->complete) return E_PENDING_;
+    /* Failed operations have no result payload. Calling their provider's
+     * GetResult can dereference an absent result (e.g. Xbox achievements).
+     * Leave cleanup to the existing completion lifecycle. */
+    if (FAILED(st->result)) return st->result;
     if (identity && st->identity && identity != st->identity) return E_INVALIDARG_;
     if (bufferSize < st->required) return E_INSUFFICIENT_;
     memset(&data, 0, sizeof(data));
@@ -1731,6 +1777,12 @@ typedef struct token_blob {
     const char *token;
     const char *signature;
 } token_blob;
+typedef struct token16_blob {
+    SIZE_T tokenCount;
+    SIZE_T signatureCount;
+    const WCHAR *token;
+    const WCHAR *signature;
+} token16_blob;
 
 static HRESULT WINAPI token_provider(UINT32 op, const XAsyncProviderData *data)
 {
@@ -1765,11 +1817,12 @@ static HRESULT WINAPI token_provider(UINT32 op, const XAsyncProviderData *data)
     }
     tok = auth_token_for(url);
     if (st) st->payload = (void *)tok;
-    complete_async(data->async, S_OK, sizeof(token_blob) + strlen(tok) + 2);
+    complete_async(data->async, S_OK, sizeof(token_blob) +
+                   (strlen(tok) + 2) * (st && st->token_utf16 ? sizeof(WCHAR) : 1));
     return S_OK;
 }
 
-static HRESULT start_token_async(XAsyncBlock *async, const char *url, const char *name)
+static HRESULT start_token_async(XAsyncBlock *async, const char *url, const char *name, int utf16)
 {
     async_state *st;
     XAsyncProviderData data;
@@ -1781,6 +1834,8 @@ static HRESULT start_token_async(XAsyncBlock *async, const char *url, const char
     st->block = async;
     st->context = (url && url[0]) ? strdup(url) : NULL;
     st->provider = token_provider;
+    st->retain_result = 1;
+    st->token_utf16 = utf16;
     snprintf(st->name, sizeof st->name, "%s", name);
     state_bind(async, st);
     memset(&data, 0, sizeof data);
@@ -1796,14 +1851,14 @@ static HRESULT WINAPI user_token_async(void *self, void *user, UINT32 opts, cons
 {
     (void)self; (void)user; (void)opts; (void)headerCount; (void)headers; (void)bodySize; (void)body;
     xlog("token %s %s", method ? method : "?", url ? url : "");
-    return start_token_async(async, url, "XUserToken");
+    return start_token_async(async, url, "XUserToken", 0);
 }
 static HRESULT WINAPI user_token_size(void *self, XAsyncBlock *async, SIZE_T *sz)
 {
     async_state *st = state_of(async);
     (void)self;
     if (!sz) return E_POINTER_;
-    if (!st || !st->complete) return E_PENDING_;
+    if (!st || !st->complete) { xlog("token size pending state=%p", st); return E_PENDING_; }
     if (FAILED(st->result)) return st->result;
     *sz = st->required;
     return S_OK;
@@ -1816,7 +1871,7 @@ static HRESULT WINAPI user_token_result(void *self, XAsyncBlock *async, SIZE_T s
     char *dst;
     SIZE_T need;
     (void)self;
-    if (!st || !st->complete) return E_PENDING_;
+    if (!st || !st->complete) { xlog("token result pending state=%p", st); return E_PENDING_; }
     if (FAILED(st->result)) return st->result;
     tok = st->payload ? (const char *)st->payload : "";
     need = sizeof(token_blob) + strlen(tok) + 2;
@@ -1831,6 +1886,34 @@ static HRESULT WINAPI user_token_result(void *self, XAsyncBlock *async, SIZE_T s
     blob->signature = dst + blob->tokenSize;
     if (ptr) *(void **)ptr = blob;
     if (used) *used = need;
+    xlog("token result bytes=%llu", (unsigned long long)strlen(tok));
+    consume_async(st);
+    return S_OK;
+}
+static HRESULT WINAPI user_token16_result(void *self, XAsyncBlock *async, SIZE_T cap, void *buffer, void *ptr, SIZE_T *used)
+{
+    async_state *st=state_of(async);
+    const char *token;
+    token16_blob *blob;
+    WCHAR *text;
+    SIZE_T chars,need;
+    (void)self;
+    if(!st || !st->complete) return E_PENDING_;
+    if(FAILED(st->result)) return st->result;
+    token=st->payload?(const char *)st->payload:"";
+    chars=MultiByteToWideChar(CP_UTF8,0,token,-1,NULL,0);
+    if(!chars) return E_FAIL_;
+    need=sizeof(*blob)+(chars+1)*sizeof(WCHAR);
+    if(!buffer || cap<need) return E_INSUFFICIENT_;
+    blob=buffer; text=(WCHAR *)(blob+1);
+    if(!MultiByteToWideChar(CP_UTF8,0,token,-1,text,(int)chars)) return E_FAIL_;
+    text[chars]=0;
+    blob->tokenCount=chars; blob->signatureCount=1;
+    blob->token=text; blob->signature=text+chars;
+    if(ptr) *(void **)ptr=blob;
+    if(used) *used=need;
+    xlog("token UTF16 result characters=%llu",(unsigned long long)(chars-1));
+    consume_async(st);
     return S_OK;
 }
 static HRESULT WINAPI user_token16_async(void *self, void *user, UINT32 opts, const WCHAR *method, const WCHAR *url,
@@ -1841,7 +1924,7 @@ static HRESULT WINAPI user_token16_async(void *self, void *user, UINT32 opts, co
     url8[0] = 0;
     if (url) WideCharToMultiByte(CP_UTF8, 0, url, -1, url8, sizeof url8, NULL, NULL);
     xlog("token utf16 %s", url8);
-    return start_token_async(async, url8[0] ? url8 : NULL, "XUserToken16");
+    return start_token_async(async, url8[0] ? url8 : NULL, "XUserToken16", 1);
 }
 static HRESULT WINAPI user_issue_async(void *self, void *user, const char *url, XAsyncBlock *async)
 {
@@ -2020,7 +2103,7 @@ static void *user_vtbl[] = {
     user_pic_async, user_pic_size, user_pic_result, user_age, user_priv,
     user_resolve_priv_async, user_resolve_priv_result,
     user_token_async, user_token_size, user_token_result,
-    user_token16_async, user_token_size, user_token_result,
+    user_token16_async, user_token_size, user_token16_result,
     user_issue_async, user_issue_result, user_issue16_async, user_issue_result,
     user_reg_change, user_unreg_change, user_deferral, user_close_deferral,
     user_add_by_id, user_add_by_id_result,
@@ -2357,14 +2440,49 @@ static BOOL WINAPI hook_read(void *request, void *buffer, DWORD cap, DWORD *read
     return ok;
 }
 
+/* Extract only short error identifiers, never response bodies or credentials. */
+static void log_http_error_identifiers(void *request, const void *body, DWORD length)
+{
+    const char *keys[] = { "\"error\"", "\"errorCode\"", "\"code\"", "\"errorType\"" };
+    char text[2049];
+    SIZE_T i, n = length < sizeof(text) - 1 ? length : sizeof(text) - 1;
+    memcpy(text, body, n);
+    text[n] = 0;
+    for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        char value[81], *p = strstr(text, keys[i]);
+        SIZE_T used = 0;
+        if (!p) continue;
+        p = strchr(p + strlen(keys[i]), ':');
+        if (!p) continue;
+        for (p++; *p == ' ' || *p == '\t' || *p == '"'; p++);
+        while ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+               (*p >= '0' && *p <= '9') || *p == '_' || *p == '-') {
+            if (used >= sizeof(value) - 1) break;
+            value[used++] = *p++;
+        }
+        value[used] = 0;
+        if (used && used < sizeof(value) - 1 && !strstr(value, "eyJ") && !strstr(value, "XBL3"))
+            xlog("http error identifier status=%d %s=%s", http_status_of(request), keys[i], value);
+    }
+}
+
 /* XCurl drives WinHTTP asynchronously: WinHttpReadData returns before any data
  * arrives and the bytes show up in the READ_COMPLETE callback instead. Wrap the
  * callback so the sensitive trace can capture error response bodies. */
 #define WINHTTP_CALLBACK_STATUS_READ_COMPLETE 0x00080000u
 static void CALLBACK hook_status_cb(void *handle, DWORD_PTR ctx, DWORD status, void *info, DWORD info_len)
 {
-    if (status == WINHTTP_CALLBACK_STATUS_READ_COMPLETE && info && info_len && http_status_of(handle) >= 400)
+    if (status == 0x00020000u && real_query) { /* HEADERS_AVAILABLE */
+        DWORD code = 0, size = sizeof(code);
+        if (real_query(handle, 19 | 0x20000000, NULL, &code, &size, NULL)) {
+            http_status_set(handle, code);
+            if (code >= 400) xlog("http async status %lu", (unsigned long)code);
+        }
+    }
+    if (status == WINHTTP_CALLBACK_STATUS_READ_COMPLETE && info && info_len && http_status_of(handle) >= 400) {
+        log_http_error_identifiers(handle, info, info_len);
         dump_sensitive_response_chunk(handle, info, info_len);
+    }
     if (real_status_cb) real_status_cb(handle, ctx, status, info, info_len);
 }
 static void *WINAPI hook_set_callback(void *handle, http_status_cb cb, DWORD flags, DWORD_PTR reserved)
@@ -2592,6 +2710,10 @@ static HRESULT WINAPI protocol_qi(com_obj *self, const GUID *iid, void **out)
     return gen_qi(self, iid, out, ok, 1);
 }
 
+
+#include "xgamesave-local.h"
+#include "xstore-diagnostic.h"
+
 static void fix_vtbls(void)
 {
     ((void **)threading_vtbl)[0] = threading_qi;
@@ -2611,6 +2733,11 @@ static void fix_vtbls(void)
 
 static int known_and_qi(const GUID *id, const GUID *iid, void **out)
 {
+    if (guid_eq(id, &IID_Store0) || guid_eq(id, &IID_Store1) || guid_eq(id, &IID_Store2) ||
+        guid_eq(id, &IID_Store3) || guid_eq(id, &IID_Store4) || guid_eq(id, &IID_Store5))
+        return store_qi(&store_obj, iid, out);
+    if (guid_eq(id, &IID_Save) || guid_eq(id, &IID_Save2) || guid_eq(id, &IID_Save3))
+        return save_qi(&save_obj, iid, out);
     if (guid_eq(id, &IID_Threading)) return threading_qi(&threading_obj, iid, out);
     if (guid_eq(id, &IID_Feature)) return feature_qi(&feature_obj, iid, out);
     if (guid_eq(id, &IID_User) || guid_eq(id, &IID_User2) || guid_eq(id, &IID_User3) ||

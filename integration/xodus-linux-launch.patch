@@ -1,0 +1,270 @@
+diff --git a/crates/xodus-cli/src/commands.rs b/crates/xodus-cli/src/commands.rs
+index dc75156..2495900 100644
+--- a/crates/xodus-cli/src/commands.rs
++++ b/crates/xodus-cli/src/commands.rs
+@@ -9,3 +9,4 @@ pub mod logout;
+ pub mod run;
+ pub mod splicense;
+ pub mod streaming;
++pub mod store_token;
+diff --git a/crates/xodus-cli/src/commands/run.rs b/crates/xodus-cli/src/commands/run.rs
+index bc62549..e0f16ac 100644
+--- a/crates/xodus-cli/src/commands/run.rs
++++ b/crates/xodus-cli/src/commands/run.rs
+@@ -1,5 +1,6 @@
+ use std::collections::HashMap;
+-use std::os::fd::{AsFd, IntoRawFd};
++use std::io::{Read, Seek, SeekFrom, Write};
++use std::os::fd::{AsFd, AsRawFd};
+ use std::path::Path;
+ use std::process::ExitCode;
+ 
+@@ -24,6 +25,46 @@ fn make_temp_file(_folder: &str) -> std::io::Result<std::fs::File> {
+     Ok(std::fs::File::from(fd))
+ }
+ 
++// Wine probes the main image on disk before consulting WINE_DLL_FILE_MAP.
++// Give that probe only the decrypted PE headers; the loader uses the memfd.
++#[cfg(target_os = "linux")]
++fn make_launch_stub(
++    image: &std::fs::File,
++    directory: &Path,
++) -> std::io::Result<tempfile::NamedTempFile> {
++    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid PE headers");
++    let mut reader = image.try_clone()?;
++    reader.seek(SeekFrom::Start(0))?;
++    let mut dos = [0u8; 64];
++    reader.read_exact(&mut dos)?;
++    if &dos[..2] != b"MZ" {
++        return Err(invalid());
++    }
++    let pe_offset = u32::from_le_bytes(dos[60..64].try_into().unwrap()) as u64;
++    reader.seek(SeekFrom::Start(pe_offset))?;
++    let mut pe = [0u8; 88];
++    reader.read_exact(&mut pe)?;
++    if &pe[..4] != b"PE\0\0" {
++        return Err(invalid());
++    }
++    let header_size = u32::from_le_bytes(pe[84..88].try_into().unwrap()) as u64;
++    let image_size = image.metadata()?.len();
++    if header_size < pe_offset + 88 || header_size > image_size || header_size > 1024 * 1024 {
++        return Err(invalid());
++    }
++    let mut headers = vec![0u8; header_size as usize];
++    reader.seek(SeekFrom::Start(0))?;
++    reader.read_exact(&mut headers)?;
++    let mut stub = tempfile::Builder::new()
++        .prefix(".xodus-launch-")
++        .suffix(".exe")
++        .tempfile_in(directory)?;
++    stub.write_all(&headers)?;
++    stub.as_file().set_len(image_size)?;
++    stub.flush()?;
++    Ok(stub)
++}
++
+ #[cfg(not(target_os = "linux"))]
+ fn make_temp_file(folder: &str) -> std::io::Result<std::fs::File> {
+     if folder.is_empty() {
+@@ -205,7 +246,7 @@ pub async fn run(
+         flags.remove(FdFlags::CLOEXEC);
+         fcntl_setfd(stdf.as_fd(), flags).unwrap();
+ 
+-        fds.push((file.0, stdf.into_raw_fd()));
++        fds.push((file.0, stdf));
+     }
+ 
+     let mut env_value = String::new();
+@@ -213,23 +254,41 @@ pub async fn run(
+     let nt_prefix = nt_prefix.trim_end_matches('\\');
+ 
+     let mut nt_entry = None;
++    #[cfg(target_os = "linux")]
++    let mut _launch_stub = None;
+ 
+-    for fd in fds {
++    for fd in &fds {
+         if !env_value.is_empty() {
+             env_value.push('|');
+         }
+ 
+         let nt_suffix = fd.0.trim_start_matches('\\');
+-        let nt_path = format!("\\??\\Z:{}\\{}", nt_prefix, nt_suffix);
+-        if let Some(exe) = &exe {
+-            if exe == fd.0 {
+-                nt_entry = Some(nt_path)
++        let selected = if let Some(exe) = &exe {
++            exe.replace('/', "\\").trim_start_matches('\\') == nt_suffix
++        } else {
++            nt_entry.is_none() && nt_suffix.to_ascii_lowercase().ends_with(".exe")
++        };
++        if selected {
++            let source_path = out_absolute.join(nt_suffix.replace('\\', "/"));
++            #[cfg(target_os = "linux")]
++            {
++                let stub = match make_launch_stub(&fd.1, source_path.parent().unwrap()) {
++                    Ok(stub) => stub,
++                    Err(err) => {
++                        eprintln!("Could not prepare launch headers: {err}");
++                        return ExitCode::FAILURE;
++                    }
++                };
++                let stub_nt = format!("\\??\\Z:{}", stub.path().to_string_lossy().replace('/', "\\"));
++                env_value.push_str(&format!("{}:{stub_nt}|", fd.1.as_raw_fd()));
++                nt_entry = Some(stub.path().to_owned());
++                _launch_stub = Some(stub);
+             }
+-        } else if nt_entry.is_none() {
+-            nt_entry = Some(nt_path)
++            #[cfg(not(target_os = "linux"))]
++            { nt_entry = Some(source_path); }
+         }
+ 
+-        env_value.push_str(&format!("{}:\\??\\Z:{}\\{}", fd.1, nt_prefix, nt_suffix))
++        env_value.push_str(&format!("{}:\\??\\Z:{}\\{}", fd.1.as_raw_fd(), nt_prefix, nt_suffix))
+     }
+ 
+     let Some(nt_entry) = nt_entry else {
+@@ -239,6 +298,7 @@ pub async fn run(
+ 
+     let mut wn = Command::new(wine)
+         .arg(nt_entry)
++        .current_dir(&out_absolute)
+         .env("WINE_DLL_FILE_MAP", env_value)
+         .spawn()
+         .unwrap();
+diff --git a/crates/xodus-cli/src/license.rs b/crates/xodus-cli/src/license.rs
+index b90fa61..7079ae3 100644
+--- a/crates/xodus-cli/src/license.rs
++++ b/crates/xodus-cli/src/license.rs
+@@ -4,12 +4,10 @@ use xodus::models::secrets::Token;
+ use xodus::models::soap;
+ use xodus::tokens::TokenManager;
+ 
+-pub async fn get_license(
++async fn get_store_identity(
+     client: &reqwest::Client,
+     tokens: &TokenManager,
+-    content_id: String,
+-    market: String,
+-) -> std::result::Result<(DeviceKey, SPLicense), String> {
++) -> std::result::Result<(String, String, String), String> {
+     let dev_token = tokens.get_device_sts_token().unwrap();
+     let Token::Legacy(dev_token) = dev_token else {
+         return Err("Invalid STS token".to_string());
+@@ -70,11 +68,34 @@ pub async fn get_license(
+         return Err("Unsupported token".to_string());
+     };
+ 
++    Ok((ms_device_token, user_token, user.puid))
++}
++
++pub async fn get_store_license_token(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    parent_product_id: String,
++    products: Vec<String>,
++    custom_developer_string: String,
++) -> std::result::Result<String, String> {
++    let (device, user, reference) = get_store_identity(client, tokens).await?;
++    xodus::licensing::content::get_license_token(
++        client, device, user, reference, parent_product_id, products, custom_developer_string,
++    ).await.map_err(|_| "Microsoft license-token request failed".to_owned())
++}
++
++pub async fn get_license(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    content_id: String,
++    market: String,
++) -> std::result::Result<(DeviceKey, SPLicense), String> {
++    let (ms_device_token, user_token, ticket_reference) = get_store_identity(client, tokens).await?;
+     let (_content, game_license) = xodus::licensing::content::get_license_content(
+         client,
+         ms_device_token,
+         user_token,
+-        user.puid,
++        ticket_reference,
+         content_id,
+         market,
+     )
+diff --git a/crates/xodus-cli/src/main.rs b/crates/xodus-cli/src/main.rs
+index cf0db1d..09b40ce 100644
+--- a/crates/xodus-cli/src/main.rs
++++ b/crates/xodus-cli/src/main.rs
+@@ -51,6 +51,11 @@ enum SubCommand {
+         key_file: Option<String>,
+     },
+     Login,
++    #[command(about = "Request a Microsoft-signed license token into a private file")]
++    StoreToken {
++        request: String,
++        output: String,
++    },
+     Logout {
+         #[arg(long, default_value_t = false, help = "Remove device license")]
+         device: bool,
+@@ -188,6 +193,9 @@ async fn main() -> ExitCode {
+             .await
+         }
+         SubCommand::Login => commands::login::run(&client, &tokens).await,
++        SubCommand::StoreToken { request, output } => {
++            commands::store_token::run(&client, &tokens, request, output).await
++        }
+         SubCommand::Logout { device } => commands::logout::run(&tokens, device).await,
+         SubCommand::Extract {
+             path,
+diff --git a/crates/xodus-cli/src/commands/store_token.rs b/crates/xodus-cli/src/commands/store_token.rs
+new file mode 100644
+index 0000000..25b1516
+--- /dev/null
++++ b/crates/xodus-cli/src/commands/store_token.rs
+@@ -0,0 +1,48 @@
++use std::io::{Cursor, Read, Write};
++use std::path::Path;
++use std::process::ExitCode;
++use xodus::tokens::TokenManager;
++
++fn field(input: &mut Cursor<Vec<u8>>, max: usize) -> Result<String, ()> {
++    let mut size = [0u8; 4];
++    input.read_exact(&mut size).map_err(|_| ())?;
++    let size = u32::from_le_bytes(size) as usize;
++    if size == 0 || size > max { return Err(()); }
++    let mut text = vec![0; size];
++    input.read_exact(&mut text).map_err(|_| ())?;
++    String::from_utf8(text).map_err(|_| ())
++}
++
++fn parse(data: Vec<u8>) -> Result<(Vec<String>, String), ()> {
++    if data.len() > 8192 { return Err(()); }
++    let mut input = Cursor::new(data);
++    let mut count = [0; 4];
++    input.read_exact(&mut count).map_err(|_| ())?;
++    let count = u32::from_le_bytes(count);
++    if count == 0 || count > 64 { return Err(()); }
++    let mut products = Vec::new();
++    for _ in 0..count {
++        let id = field(&mut input, 32)?;
++        if !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'/') { return Err(()); }
++        products.push(id);
++    }
++    let custom = field(&mut input, 4096)?;
++    if input.position() != input.get_ref().len() as u64 { return Err(()); }
++    Ok((products, custom))
++}
++
++pub async fn run(client: &reqwest::Client, tokens: &TokenManager, request: String, output: String) -> ExitCode {
++    let Ok(data) = std::fs::read(request) else { eprintln!("Could not read Store request"); return ExitCode::FAILURE; };
++    let Ok((products, custom)) = parse(data) else { eprintln!("Invalid Store request"); return ExitCode::FAILURE; };
++    let result = crate::license::get_store_license_token(client, tokens, "9P5786PJB9RP".to_owned(), products, custom).await;
++    let Ok(token) = result else { eprintln!("Microsoft license-token request failed"); return ExitCode::FAILURE; };
++    if token.is_empty() { eprintln!("Microsoft returned an empty license token"); return ExitCode::FAILURE; }
++    let output = Path::new(&output);
++    let Some(parent) = output.parent() else { return ExitCode::FAILURE; };
++    let Ok(mut file) = tempfile::NamedTempFile::new_in(parent) else { return ExitCode::FAILURE; };
++    // NamedTempFile creates the file with mode 0600 on Unix. No token is printed.
++    if file.write_all(token.as_bytes()).is_err() || file.as_file().sync_all().is_err() || file.persist(output).is_err() {
++        eprintln!("Could not save the license-token response"); return ExitCode::FAILURE;
++    }
++    ExitCode::SUCCESS
++}
