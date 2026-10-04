@@ -2700,8 +2700,6 @@ static HRESULT WINAPI protocol_qi(com_obj *self, const GUID *iid, void **out)
     return gen_qi(self, iid, out, ok, 1);
 }
 
-#include "xgamesave.h"
-#include "xstore.h"
 
 static void fix_vtbls(void)
 {
@@ -2741,11 +2739,6 @@ static int known_and_qi(const GUID *id, const GUID *iid, void **out)
         return protocol_qi(&protocol_obj, iid, out);
     if (guid_eq(id, &IID_Net) || guid_eq(id, &IID_Net2))
         return net_qi(&net_obj, iid, out);
-    if (guid_eq(id, &IID_Store0) || guid_eq(id, &IID_Store1) || guid_eq(id, &IID_Store2) ||
-        guid_eq(id, &IID_Store3) || guid_eq(id, &IID_Store4) || guid_eq(id, &IID_Store5))
-        return store_qi(&store_obj, iid, out);
-    if (guid_eq(id, &IID_Save) || guid_eq(id, &IID_Save2) || guid_eq(id, &IID_Save3))
-        return save_qi(&save_obj, iid, out);
     return 1; /* not ours */
 }
 

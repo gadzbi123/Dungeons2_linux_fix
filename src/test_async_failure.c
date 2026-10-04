@@ -27,6 +27,47 @@ static void **vt;
 static const char identity[] = "probe";
 static int getresult_calls, callbacks;
 static HRESULT callback_hr;
+static void __stdcall token_done(XAsyncBlock *b) { (void)b; callbacks++; }
+
+/* Retrieve after completion has returned: this also catches premature cleanup
+ * and the former ASCII result returned from the UTF-16 API. CI supplies a
+ * dummy cached token in an isolated prefix; no network sign-in is involved. */
+static int token_case(HRESULT (__stdcall *query)(const GUID *, const GUID *, void **), void *queue)
+{
+    GUID id = { 0x01acd177, 0x91f9, 0x4763, { 0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0 } };
+    struct token_data { SIZE_T tokenCount, signatureCount; const WCHAR *token, *signature; } *token;
+    XAsyncBlock block = {0};
+    void *user, **uv, *buffer;
+    SIZE_T size;
+    HRESULT hr;
+    int ok;
+    if (query(&id, &id, &user) || !user) return 0;
+    uv = *(void ***)user;
+    block.queue = queue;
+    block.callback = token_done;
+    callbacks = 0;
+    hr = ((HRESULT (__stdcall *)(void *, void *, uint32_t, const WCHAR *, const WCHAR *,
+                                uint32_t, const void *, uint32_t, const void *, XAsyncBlock *))uv[26])
+        (user, NULL, 0, L"GET", L"https://api.minecraftservices.com", 0, NULL, 0, NULL, &block);
+    if (FAILED(hr)) return 0;
+    ((unsigned char (__stdcall *)(void *, void *, uint32_t, uint32_t))vt[16])(thr, queue, 0, 100);
+    ((unsigned char (__stdcall *)(void *, void *, uint32_t, uint32_t))vt[16])(thr, queue, 1, 100);
+    if (callbacks != 1 || ((HRESULT (__stdcall *)(void *, XAsyncBlock *, SIZE_T *))uv[27])(user, &block, &size)) return 0;
+    buffer = HeapAlloc(GetProcessHeap(), 0, size);
+    if (!buffer) return 0;
+    hr = ((HRESULT (__stdcall *)(void *, XAsyncBlock *, SIZE_T, void *, void *, SIZE_T *))uv[28])
+        (user, &block, size - 1, buffer, &token, NULL);
+    ok = FAILED(hr);
+    hr = ((HRESULT (__stdcall *)(void *, XAsyncBlock *, SIZE_T, void *, void *, SIZE_T *))uv[28])
+        (user, &block, size, buffer, &token, NULL);
+    ok &= SUCCEEDED(hr);
+    if (SUCCEEDED(hr))
+        ok &= token->tokenCount == 8 && !lstrcmpW(token->token, L"fixture") &&
+              token->signatureCount == 1 && !*token->signature;
+    HeapFree(GetProcessHeap(), 0, buffer);
+    printf("UTF16 deferred result and buffer retry: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
 
 static HRESULT __stdcall provider(uint32_t op, const XAsyncProviderData *d)
 {
@@ -89,6 +130,7 @@ int main(void)
     }
     ok = run_case(queue, HRESULT_FROM_WIN32(ERROR_NOT_FOUND), 0);
     ok &= run_case(queue, S_OK, 1);
+    ok &= token_case(query, queue);
     printf(ok ? "OK\n" : "FAIL\n");
     return ok ? 0 : 1;
 }

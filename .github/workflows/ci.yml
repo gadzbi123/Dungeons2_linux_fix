@@ -19,7 +19,7 @@ jobs:
         run: ./build.sh
       - name: Build tests
         run: |
-          for t in test_xgr test_async_failure test_save_storage; do
+          for t in test_xgr test_async_failure; do
             x86_64-w64-mingw32-gcc -O2 -Wall -Wextra -o "src/$t.exe" "src/$t.c"
           done
       - name: Run tests under Wine
@@ -31,5 +31,3 @@ jobs:
           printf 'xuid=1\nxbox=fixture\nmc=fixture\nexp=4102444800\n' > "$WINEPREFIX/drive_c/users/steamuser/AppData/Local/Dungeons2/tokens.txt"
           wine test_xgr.exe
           wine test_async_failure.exe
-          wine test_save_storage.exe
-          wine test_save_storage.exe --read
