@@ -60,3 +60,17 @@ The DLL already in `src/` is ready to install. To build it yourself, run `./buil
 ## What the game gets
 
 The DLL answers the Gaming Services calls this title makes: task queues, a signed-in Xbox user (your real XUID and gamertag from the cache), title id, retail sandbox, persistent local storage, and the HTTPS security settings XCurl asks for before it connects. PlayFab login still uses the Steam session. The Microsoft token is returned only when the game asks for one, and the DLL picks the token that matches the requested service: the Minecraft token for `api.minecraftservices.com`, the PlayFab token for `playfabapi.com`, and the general Xbox token for everything else such as `*.xboxlive.com`.
+
+## Microsoft Store build (experimental)
+
+`src/xgamesave.h` and `src/xstore.h` add what the purchased Microsoft Store (WinGDK) build needs on top of the Steam build. This is a draft. `install.sh` handles Steam only, and the prebuilt `src/xgameruntime.dll` does not include these changes yet (rebuild with `./build.sh`).
+
+- **Saves:** XGameSave and XGameSaveFiles are stored locally under `C:\users\steamuser\AppData\Local\Dungeons2\XGameSaveLocal\<XUID>\<SCID>`. Nothing syncs to the cloud. Each submit writes a new generation and then atomically switches `CURRENT` to it. Old generations are never deleted yet.
+- **Store license:** only `XStoreCreateContext` and `XStoreQueryLicenseToken*` work. Every other XStore call fails. The token is a real one that Microsoft issues for the account that bought the game. The DLL fetches it through `integration/store-license-bridge.py`, and that script needs an `xodus-cli store-token` command that upstream Xodus does not have yet. Set `XODUS_STORE_BRIDGE_PATH` to the Windows path of the bridge directory. Without it, the query fails. Launching the Store build also needs Xodus and a compatible Wine, and this repository provides neither.
+- **Async changes that also affect Steam:** token, save and Store results stay readable after the completion callback until the game reads them. The UTF-16 token API now returns UTF-16 strings. `XAsyncGetResult` on a failed operation returns the error without calling the provider. That fixed a cutscene crash in the Store build.
+
+Tested only with Store build 1.1.1.0 on one custom Wine 11 setup. What worked there: sign-in, the Store entitlement request, settings surviving a restart, and the cutscene that used to crash. Not tested: the Steam build after these changes, cloud saves, multiplayer, purchases and long sessions. Open issue: quitting after about ten minutes of play crashed inside an async completion callback, and the cause is unknown.
+
+## Tests
+
+CI builds with MinGW and runs the queue, failed-result and save/token regressions under Wine in a throwaway prefix with dummy test tokens. No Microsoft credentials are required.
