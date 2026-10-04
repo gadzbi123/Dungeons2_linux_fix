@@ -1,5 +1,9 @@
-/* Integration check against real local disk, including deferred async results
- * and reading data written by an earlier process. Uses a separate test SCID.
+/* Manual check of the local save backend, retained async results, UTF-16
+ * tokens and callback block lifetime. Builds the runtime source in, so it
+ * needs no DLL: run it, then run it again with --read to check data written
+ * by an earlier process. It reads tokens.txt like the runtime (only the xuid
+ * and mc values are used; dummy values work) and writes a separate test SCID.
+ * Use a throwaway WINEPREFIX and HOME, never a real game prefix.
  */
 #include "xgameruntime.c"
 static volatile LONG check_callback_done;
@@ -18,14 +22,14 @@ static void WINAPI guard_callback(XAsyncBlock *block)
     check_condition(VirtualProtect(block,4096,PAGE_NOACCESS,&old),"guard callback releases block access");
     InterlockedExchange(&check_callback_done,1);
 }
-void WINAPI check_entry(void)
+int main(void)
 {
     gs_provider *p; gs_container *c; gs_update *u; XAsyncBlock async={0};
     BYTE payload[]={0x00,0x12,0xff,0x00,0x34}; const char *names[]={"state"};
     gs_blob_result *result; SIZE_T size; UINT32 count; HRESULT hr; int reader;
     DllMain(GetModuleHandleA(NULL),DLL_PROCESS_ATTACH,NULL);
     InitializeApiImpl(0,0); async.callback=check_callback;
-    check_hr(save_init_async(NULL,&user_obj,"CodexStorageRegression",FALSE,&async),"async initialize");
+    check_hr(save_init_async(NULL,&user_obj,"StorageRegressionCheck",FALSE,&async),"async initialize");
     for(int i=0; !check_callback_done && i<5000; i++) Sleep(1);
     check_condition(check_callback_done,"completion callback"); Sleep(20);
     check_hr(save_init_result(NULL,&async,&p),"result after callback returns");
@@ -64,7 +68,7 @@ void WINAPI check_entry(void)
         check_condition(buffer!=NULL,"allocate token buffer");
         check_hr(user_token16_result(NULL,&async,size,buffer,&token,NULL),"UTF16 result after callback");
         check_condition(MultiByteToWideChar(CP_UTF8,0,g_mc_token,-1,expected,8192)>0,"expected UTF16 conversion");
-        check_condition(token->tokenCount==lstrlenW(expected)+1 && !lstrcmpW(token->token,expected) && !*token->signature,"Unicode token bytes and termination");
+        check_condition(token->tokenCount==(SIZE_T)lstrlenW(expected)+1 && !lstrcmpW(token->token,expected) && !*token->signature,"Unicode token bytes and termination");
         free(buffer);
     }
     puts("PASS UTF16 token: cached authentication, Unicode conversion, deferred result and termination");
@@ -73,7 +77,7 @@ void WINAPI check_entry(void)
         check_callback_done=0;
         check_hr(thr_QueueCreate(NULL,MODE_MANUAL,MODE_MANUAL,&q),"manual async queue");
         pending.queue=q; pending.callback=check_callback;
-        check_hr(save_init_async(NULL,&user_obj,"CodexStorageRegression",FALSE,&pending),"manual initialization");
+        check_hr(save_init_async(NULL,&user_obj,"StorageRegressionCheck",FALSE,&pending),"manual initialization");
         check_condition(dispatch_one(q,PORT_WORK),"manual work dispatch");
         check_hr(save_init_result(NULL,&pending,&provider),"consume result before callback dispatch");
         check_condition(dispatch_one(q,PORT_COMP) && check_callback_done,"pending callback still delivered");

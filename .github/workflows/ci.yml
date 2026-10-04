@@ -1,0 +1,35 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    env:
+      WINEDEBUG: -all
+      WINEDLLOVERRIDES: xgameruntime=n;mscoree,mshtml=
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64 and Wine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 wine wine64
+      - name: Build runtime
+        run: ./build.sh
+      - name: Build tests
+        run: |
+          for t in test_xgr test_async_failure test_save_storage; do
+            x86_64-w64-mingw32-gcc -O2 -Wall -Wextra -o "src/$t.exe" "src/$t.c"
+          done
+      - name: Run tests under Wine
+        working-directory: src
+        run: |
+          export WINEPREFIX="$RUNNER_TEMP/wineprefix"
+          wineboot -u
+          mkdir -p "$WINEPREFIX/drive_c/users/steamuser/AppData/Local/Dungeons2"
+          printf 'xuid=1\nxbox=fixture\nmc=fixture\nexp=4102444800\n' > "$WINEPREFIX/drive_c/users/steamuser/AppData/Local/Dungeons2/tokens.txt"
+          wine test_xgr.exe
+          wine test_async_failure.exe
+          wine test_save_storage.exe
+          wine test_save_storage.exe --read

@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Relay private Store requests to Xodus and Microsoft's real licensing API."""
+"""Answer XStoreQueryLicenseToken requests from xgameruntime.dll.
+
+Usage: XODUS_CLI=/path/to/xodus-cli store-license-bridge.py DIRECTORY
+
+DIRECTORY must be private (mode 0700) and given to the game as the Windows
+path in XODUS_STORE_BRIDGE_PATH. Each request is passed to
+`xodus-cli store-token REQUEST RESPONSE`, which gets the license token from
+Microsoft. Upstream Xodus does not provide that command yet.
+"""
 import os
 from pathlib import Path
 import re

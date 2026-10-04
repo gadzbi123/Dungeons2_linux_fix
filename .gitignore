@@ -6,4 +6,4 @@ login-error.txt
 __pycache__/
 *.pyc
 .venv/
-src/test_xgr.exe
+src/test_*.exe

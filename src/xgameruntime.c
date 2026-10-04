@@ -397,12 +397,12 @@ static void run_completion(async_state *st)
     if (!st || st->cleaned) return;
     block = st->block;
     if (!st->retain_result) {
-        /* Preserve the existing runtime's provider lifecycle. Only the new
-         * save, token and Store operations opt into retained results. */
         if (block && block->callback) block->callback(block);
         cleanup_state(st);
         return;
     }
+    /* Retained results stay valid after the callback until a result method
+     * consumes them, as the GDK allows. */
     EnterCriticalSection(&g_lock);
     st->callback_running = 1;
     st->completion_dispatched = 1;
@@ -414,7 +414,7 @@ static void run_completion(async_state *st)
     if (block && block->callback) block->callback(block);
     EnterCriticalSection(&g_lock);
     st->callback_running = 0;
-    cleanup = !st->retain_result || st->result_consumed;
+    cleanup = st->result_consumed;
     LeaveCriticalSection(&g_lock);
     if (cleanup) cleanup_state(st);
 }
@@ -434,6 +434,25 @@ static void consume_async(async_state *st)
     cleanup = !st->callback_running && (!st->completion_queued || st->completion_dispatched);
     LeaveCriticalSection(&g_lock);
     if (cleanup) cleanup_state(st);
+}
+
+/* Shared start of the result methods for retained operations. A failed
+ * operation has no payload, so its state is consumed immediately. */
+static HRESULT retained_result(XAsyncBlock *block, XAsyncProvider provider, async_state **out)
+{
+    async_state *st = state_of(block);
+    HRESULT hr;
+    *out = NULL;
+    if (!st) return (read_done(block, &hr, NULL) && FAILED(hr)) ? hr : E_INVALIDARG_;
+    if (st->provider != provider) return E_INVALIDARG_;
+    if (!st->complete) return E_PENDING_;
+    if (FAILED(st->result)) {
+        hr = st->result;
+        consume_async(st);
+        return hr;
+    }
+    *out = st;
+    return S_OK;
 }
 
 static void run_item(task_item *it)
@@ -840,7 +859,8 @@ static HRESULT WINAPI thr_GetResult(void *self, XAsyncBlock *async, const void *
     data.context = st->context;
     hr = st->provider ? st->provider(OP_GETRESULT, &data) : S_OK;
     if (bufferUsed) *bufferUsed = st->required;
-    cleanup_state(st);
+    if (st->retain_result) consume_async(st);
+    else cleanup_state(st);
     return hr;
 }
 
@@ -1855,24 +1875,26 @@ static HRESULT WINAPI user_token_async(void *self, void *user, UINT32 opts, cons
 }
 static HRESULT WINAPI user_token_size(void *self, XAsyncBlock *async, SIZE_T *sz)
 {
-    async_state *st = state_of(async);
+    async_state *st;
+    HRESULT hr;
     (void)self;
     if (!sz) return E_POINTER_;
-    if (!st || !st->complete) { xlog("token size pending state=%p", st); return E_PENDING_; }
-    if (FAILED(st->result)) return st->result;
+    hr = retained_result(async, token_provider, &st);
+    if (FAILED(hr)) return hr;
     *sz = st->required;
     return S_OK;
 }
 static HRESULT WINAPI user_token_result(void *self, XAsyncBlock *async, SIZE_T sz, void *buf, void *ptr, SIZE_T *used)
 {
-    async_state *st = state_of(async);
+    async_state *st;
     token_blob *blob;
     const char *tok;
     char *dst;
     SIZE_T need;
+    HRESULT hr;
     (void)self;
-    if (!st || !st->complete) { xlog("token result pending state=%p", st); return E_PENDING_; }
-    if (FAILED(st->result)) return st->result;
+    hr = retained_result(async, token_provider, &st);
+    if (FAILED(hr)) return hr;
     tok = st->payload ? (const char *)st->payload : "";
     need = sizeof(token_blob) + strlen(tok) + 2;
     if (!buf || sz < need) return E_INSUFFICIENT_;
@@ -1886,33 +1908,36 @@ static HRESULT WINAPI user_token_result(void *self, XAsyncBlock *async, SIZE_T s
     blob->signature = dst + blob->tokenSize;
     if (ptr) *(void **)ptr = blob;
     if (used) *used = need;
-    xlog("token result bytes=%llu", (unsigned long long)strlen(tok));
     consume_async(st);
     return S_OK;
 }
-static HRESULT WINAPI user_token16_result(void *self, XAsyncBlock *async, SIZE_T cap, void *buffer, void *ptr, SIZE_T *used)
+/* The UTF-16 token API returns WCHAR strings with counts in characters. */
+static HRESULT WINAPI user_token16_result(void *self, XAsyncBlock *async, SIZE_T sz, void *buf, void *ptr, SIZE_T *used)
 {
-    async_state *st=state_of(async);
-    const char *token;
+    async_state *st;
     token16_blob *blob;
-    WCHAR *text;
-    SIZE_T chars,need;
+    const char *tok;
+    WCHAR *dst;
+    SIZE_T chars, need;
+    HRESULT hr;
     (void)self;
-    if(!st || !st->complete) return E_PENDING_;
-    if(FAILED(st->result)) return st->result;
-    token=st->payload?(const char *)st->payload:"";
-    chars=MultiByteToWideChar(CP_UTF8,0,token,-1,NULL,0);
-    if(!chars) return E_FAIL_;
-    need=sizeof(*blob)+(chars+1)*sizeof(WCHAR);
-    if(!buffer || cap<need) return E_INSUFFICIENT_;
-    blob=buffer; text=(WCHAR *)(blob+1);
-    if(!MultiByteToWideChar(CP_UTF8,0,token,-1,text,(int)chars)) return E_FAIL_;
-    text[chars]=0;
-    blob->tokenCount=chars; blob->signatureCount=1;
-    blob->token=text; blob->signature=text+chars;
-    if(ptr) *(void **)ptr=blob;
-    if(used) *used=need;
-    xlog("token UTF16 result characters=%llu",(unsigned long long)(chars-1));
+    hr = retained_result(async, token_provider, &st);
+    if (FAILED(hr)) return hr;
+    tok = st->payload ? (const char *)st->payload : "";
+    chars = MultiByteToWideChar(CP_UTF8, 0, tok, -1, NULL, 0);
+    if (!chars) return E_FAIL_;
+    need = sizeof(token16_blob) + (chars + 1) * sizeof(WCHAR);
+    if (!buf || sz < need) return E_INSUFFICIENT_;
+    blob = buf;
+    dst = (WCHAR *)(blob + 1);
+    if (!MultiByteToWideChar(CP_UTF8, 0, tok, -1, dst, (int)chars)) return E_FAIL_;
+    dst[chars] = 0;
+    blob->tokenCount = chars;
+    blob->signatureCount = 1;
+    blob->token = dst;
+    blob->signature = dst + chars;
+    if (ptr) *(void **)ptr = blob;
+    if (used) *used = need;
     consume_async(st);
     return S_OK;
 }
@@ -2440,49 +2465,14 @@ static BOOL WINAPI hook_read(void *request, void *buffer, DWORD cap, DWORD *read
     return ok;
 }
 
-/* Extract only short error identifiers, never response bodies or credentials. */
-static void log_http_error_identifiers(void *request, const void *body, DWORD length)
-{
-    const char *keys[] = { "\"error\"", "\"errorCode\"", "\"code\"", "\"errorType\"" };
-    char text[2049];
-    SIZE_T i, n = length < sizeof(text) - 1 ? length : sizeof(text) - 1;
-    memcpy(text, body, n);
-    text[n] = 0;
-    for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-        char value[81], *p = strstr(text, keys[i]);
-        SIZE_T used = 0;
-        if (!p) continue;
-        p = strchr(p + strlen(keys[i]), ':');
-        if (!p) continue;
-        for (p++; *p == ' ' || *p == '\t' || *p == '"'; p++);
-        while ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-               (*p >= '0' && *p <= '9') || *p == '_' || *p == '-') {
-            if (used >= sizeof(value) - 1) break;
-            value[used++] = *p++;
-        }
-        value[used] = 0;
-        if (used && used < sizeof(value) - 1 && !strstr(value, "eyJ") && !strstr(value, "XBL3"))
-            xlog("http error identifier status=%d %s=%s", http_status_of(request), keys[i], value);
-    }
-}
-
 /* XCurl drives WinHTTP asynchronously: WinHttpReadData returns before any data
  * arrives and the bytes show up in the READ_COMPLETE callback instead. Wrap the
  * callback so the sensitive trace can capture error response bodies. */
 #define WINHTTP_CALLBACK_STATUS_READ_COMPLETE 0x00080000u
 static void CALLBACK hook_status_cb(void *handle, DWORD_PTR ctx, DWORD status, void *info, DWORD info_len)
 {
-    if (status == 0x00020000u && real_query) { /* HEADERS_AVAILABLE */
-        DWORD code = 0, size = sizeof(code);
-        if (real_query(handle, 19 | 0x20000000, NULL, &code, &size, NULL)) {
-            http_status_set(handle, code);
-            if (code >= 400) xlog("http async status %lu", (unsigned long)code);
-        }
-    }
-    if (status == WINHTTP_CALLBACK_STATUS_READ_COMPLETE && info && info_len && http_status_of(handle) >= 400) {
-        log_http_error_identifiers(handle, info, info_len);
+    if (status == WINHTTP_CALLBACK_STATUS_READ_COMPLETE && info && info_len && http_status_of(handle) >= 400)
         dump_sensitive_response_chunk(handle, info, info_len);
-    }
     if (real_status_cb) real_status_cb(handle, ctx, status, info, info_len);
 }
 static void *WINAPI hook_set_callback(void *handle, http_status_cb cb, DWORD flags, DWORD_PTR reserved)
@@ -2710,9 +2700,8 @@ static HRESULT WINAPI protocol_qi(com_obj *self, const GUID *iid, void **out)
     return gen_qi(self, iid, out, ok, 1);
 }
 
-
-#include "xgamesave-local.h"
-#include "xstore-diagnostic.h"
+#include "xgamesave.h"
+#include "xstore.h"
 
 static void fix_vtbls(void)
 {
@@ -2733,11 +2722,6 @@ static void fix_vtbls(void)
 
 static int known_and_qi(const GUID *id, const GUID *iid, void **out)
 {
-    if (guid_eq(id, &IID_Store0) || guid_eq(id, &IID_Store1) || guid_eq(id, &IID_Store2) ||
-        guid_eq(id, &IID_Store3) || guid_eq(id, &IID_Store4) || guid_eq(id, &IID_Store5))
-        return store_qi(&store_obj, iid, out);
-    if (guid_eq(id, &IID_Save) || guid_eq(id, &IID_Save2) || guid_eq(id, &IID_Save3))
-        return save_qi(&save_obj, iid, out);
     if (guid_eq(id, &IID_Threading)) return threading_qi(&threading_obj, iid, out);
     if (guid_eq(id, &IID_Feature)) return feature_qi(&feature_obj, iid, out);
     if (guid_eq(id, &IID_User) || guid_eq(id, &IID_User2) || guid_eq(id, &IID_User3) ||
@@ -2757,6 +2741,11 @@ static int known_and_qi(const GUID *id, const GUID *iid, void **out)
         return protocol_qi(&protocol_obj, iid, out);
     if (guid_eq(id, &IID_Net) || guid_eq(id, &IID_Net2))
         return net_qi(&net_obj, iid, out);
+    if (guid_eq(id, &IID_Store0) || guid_eq(id, &IID_Store1) || guid_eq(id, &IID_Store2) ||
+        guid_eq(id, &IID_Store3) || guid_eq(id, &IID_Store4) || guid_eq(id, &IID_Store5))
+        return store_qi(&store_obj, iid, out);
+    if (guid_eq(id, &IID_Save) || guid_eq(id, &IID_Save2) || guid_eq(id, &IID_Save3))
+        return save_qi(&save_obj, iid, out);
     return 1; /* not ours */
 }
 
