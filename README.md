@@ -73,4 +73,4 @@ Tested only with Store build 1.1.1.0 on one custom Wine 11 setup. What worked th
 
 ## Tests
 
-CI builds the DLL with `./build.sh` (MinGW) and runs `src/test_xgr.c` and `src/test_async_failure.c` under Wine. `src/test_save_storage.c` is a manual check. See the comment at the top of that file.
+CI builds with MinGW and runs the queue, failed-result and save/token regressions under Wine in a throwaway prefix with dummy test tokens. No Microsoft credentials are required.
